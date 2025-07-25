@@ -600,6 +600,7 @@ class Recording(db.Model):
     summary = db.Column(db.Text, nullable=True) # <-- ADDED: Summary field
     status = db.Column(db.String(50), default='PENDING') # PENDING, PROCESSING, SUMMARIZING, COMPLETED, FAILED
     audio_path = db.Column(db.String(500))
+    video_path = db.Column(db.String(500), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     meeting_date = db.Column(db.Date, nullable=True) # <-- ADDED: Meeting Date field
     file_size = db.Column(db.Integer)  # Store file size in bytes
@@ -607,6 +608,7 @@ class Recording(db.Model):
     is_inbox = db.Column(db.Boolean, default=True)  # New recordings are marked as inbox by default
     is_highlighted = db.Column(db.Boolean, default=False)  # Recordings can be highlighted by the user
     mime_type = db.Column(db.String(100), nullable=True)
+    original_mime_type = db.Column(db.String(100), nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)
     processing_time_seconds = db.Column(db.Integer, nullable=True)
     processing_source = db.Column(db.String(50), default='upload')  # upload, auto_process, recording
@@ -629,6 +631,8 @@ class Recording(db.Model):
             'meeting_date': self.meeting_date.isoformat() if self.meeting_date else None, # <-- ADDED: Include meeting_date
             'file_size': self.file_size,
             'original_filename': self.original_filename, # <-- ADDED: Include original filename
+            'video_path': self.video_path,
+            'original_mime_type': self.original_mime_type,
             'user_id': self.user_id,
             'is_inbox': self.is_inbox,
             'is_highlighted': self.is_highlighted,
@@ -801,6 +805,10 @@ with app.app_context():
             app.logger.info("Added diarize column to user table")
         if add_column_if_not_exists(engine, 'recording', 'mime_type', 'VARCHAR(100)'):
             app.logger.info("Added mime_type column to recording table")
+        if add_column_if_not_exists(engine, 'recording', 'video_path', 'VARCHAR(500)'):
+            app.logger.info("Added video_path column to recording table")
+        if add_column_if_not_exists(engine, 'recording', 'original_mime_type', 'VARCHAR(100)'):
+            app.logger.info("Added original_mime_type column to recording table")
         if add_column_if_not_exists(engine, 'recording', 'completed_at', 'DATETIME'):
             app.logger.info("Added completed_at column to recording table")
         if add_column_if_not_exists(engine, 'recording', 'processing_time_seconds', 'INTEGER'):
@@ -2418,6 +2426,8 @@ def admin_delete_user(user_id):
         try:
             if recording.audio_path and os.path.exists(recording.audio_path):
                 os.remove(recording.audio_path)
+            if recording.video_path and os.path.exists(recording.video_path):
+                os.remove(recording.video_path)
         except Exception as e:
             app.logger.error(f"Error deleting audio file {recording.audio_path}: {e}")
     
@@ -2771,36 +2781,56 @@ def upload_file():
         file.save(filepath)
         app.logger.info(f"File saved to {filepath}")
 
-        # --- Convert non-wav/mp3/flac files to WAV ---
+        original_mime_type, _ = mimetypes.guess_type(original_filename)
+
         filename_lower = original_filename.lower()
+        video_extensions = ('.mp4', '.mkv', '.mov')
         supported_formats = ('.wav', '.mp3', '.flac')
         convertible_formats = ('.amr', '.3gp', '.3gpp', '.m4a', '.aac', '.ogg', '.wma', '.webm')
-        
-        if not filename_lower.endswith(supported_formats):
+
+        video_path = None
+
+        if filename_lower.endswith(video_extensions):
+            # Extract audio from video to FLAC
+            video_path = filepath
+            base_filepath, _ = os.path.splitext(filepath)
+            flac_filepath = f"{base_filepath}.flac"
+            try:
+                subprocess.run(
+                    ['ffmpeg', '-i', video_path, '-y', '-acodec', 'flac', '-ar', '16000', '-ac', '1', flac_filepath],
+                    check=True, capture_output=True, text=True
+                )
+                app.logger.info(f"Extracted audio from {video_path} to {flac_filepath}")
+                filepath = flac_filepath
+            except FileNotFoundError:
+                app.logger.error("ffmpeg command not found. Please ensure ffmpeg is installed and in the system's PATH.")
+                return jsonify({'error': 'Audio conversion tool (ffmpeg) not found on server.'}), 500
+            except subprocess.CalledProcessError as e:
+                app.logger.error(f"ffmpeg extraction failed for {video_path}: {e.stderr}")
+                return jsonify({'error': f'Failed to process video file: {e.stderr}'}), 500
+
+        elif not filename_lower.endswith(supported_formats):
             if filename_lower.endswith(convertible_formats):
                 app.logger.info(f"Converting {filename_lower} format to WAV for processing.")
             else:
                 app.logger.info(f"Attempting to convert unknown format ({filename_lower}) to WAV.")
-            
+
             base_filepath, _ = os.path.splitext(filepath)
             temp_wav_filepath = f"{base_filepath}_temp.wav"
             wav_filepath = f"{base_filepath}.wav"
 
             try:
-                # Using -acodec pcm_s16le for standard WAV format, 16kHz sample rate, mono
                 subprocess.run(
                     ['ffmpeg', '-i', filepath, '-y', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav_filepath],
                     check=True, capture_output=True, text=True
                 )
                 app.logger.info(f"Successfully converted {filepath} to {temp_wav_filepath}")
-                
-                # If the original file is not the same as the final wav file, remove it
+
                 if filepath.lower() != wav_filepath.lower():
                     os.remove(filepath)
-                
-                # Rename the temporary file to the final filename
+
                 os.rename(temp_wav_filepath, wav_filepath)
-                
+
                 filepath = wav_filepath
             except FileNotFoundError:
                 app.logger.error("ffmpeg command not found. Please ensure ffmpeg is installed and in the system's PATH.")
@@ -2822,6 +2852,7 @@ def upload_file():
         # Create initial database entry
         recording = Recording(
             audio_path=filepath,
+            video_path=video_path,
             original_filename=original_filename,
             title=f"Recording - {original_filename}",
             file_size=final_file_size,
@@ -2829,6 +2860,7 @@ def upload_file():
             meeting_date=datetime.utcnow().date(),
             user_id=current_user.id,
             mime_type=mime_type,
+            original_mime_type=original_mime_type,
             notes=notes,
             processing_source='upload'  # Track that this was manually uploaded
         )
@@ -2914,6 +2946,44 @@ def get_shared_audio(public_id):
         app.logger.error(f"Error serving shared audio for public_id {public_id}: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred.'}), 500
 
+# Get Video Endpoint
+@app.route('/video/<int:recording_id>')
+@login_required
+def get_video(recording_id):
+    try:
+        recording = db.session.get(Recording, recording_id)
+        if not recording or not recording.video_path:
+            return jsonify({'error': 'Recording or video file not found'}), 404
+
+        if recording.user_id and recording.user_id != current_user.id:
+            return jsonify({'error': 'You do not have permission to access this video file'}), 403
+
+        if not os.path.exists(recording.video_path):
+            app.logger.error(f"Video file missing from server: {recording.video_path}")
+            return jsonify({'error': 'Video file missing from server'}), 404
+
+        return send_file(recording.video_path)
+    except Exception as e:
+        app.logger.error(f"Error serving video for recording {recording_id}: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
+
+@app.route('/share/video/<string:public_id>')
+def get_shared_video(public_id):
+    try:
+        share = Share.query.filter_by(public_id=public_id).first_or_404()
+        recording = share.recording
+        if not recording or not recording.video_path:
+            return jsonify({'error': 'Recording or video file not found'}), 404
+
+        if not os.path.exists(recording.video_path):
+            app.logger.error(f"Video file missing from server: {recording.video_path}")
+            return jsonify({'error': 'Video file missing from server'}), 404
+
+        return send_file(recording.video_path)
+    except Exception as e:
+        app.logger.error(f"Error serving shared video for public_id {public_id}: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
+
 # Delete Recording Endpoint
 @app.route('/recording/<int:recording_id>', methods=['DELETE'])
 @login_required
@@ -2932,6 +3002,9 @@ def delete_recording(recording_id):
             if recording.audio_path and os.path.exists(recording.audio_path):
                 os.remove(recording.audio_path)
                 app.logger.info(f"Deleted audio file: {recording.audio_path}")
+            if recording.video_path and os.path.exists(recording.video_path):
+                os.remove(recording.video_path)
+                app.logger.info(f"Deleted video file: {recording.video_path}")
         except Exception as e:
             app.logger.error(f"Error deleting audio file {recording.audio_path}: {e}")
 
