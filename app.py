@@ -36,6 +36,7 @@ from babel.dates import format_datetime
 import ast
 import logging
 import secrets
+from utils.media import convert_to_flac, AudioConversionError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1772,40 +1773,17 @@ def reprocess_transcription(recording_id):
 
         supported_formats = ('.wav', '.mp3', '.flac')
         if not filename_lower.endswith(supported_formats):
-            app.logger.info(f"Reprocessing: Converting {filename_lower} format to WAV.")
-            base_filepath, file_ext = os.path.splitext(filepath)
-            temp_wav_filepath = f"{base_filepath}_temp.wav"
-            final_wav_filepath = f"{base_filepath}.wav"
-
+            app.logger.info(f"Reprocessing: Converting {filename_lower} format to FLAC.")
             try:
-                # Convert to a temporary file first
-                subprocess.run(
-                    ['ffmpeg', '-i', filepath, '-y', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav_filepath],
-                    check=True, capture_output=True, text=True
-                )
-                app.logger.info(f"Successfully converted {filepath} to {temp_wav_filepath}")
-
-                # If the original file is not the same as the final wav file, remove it
-                if filepath.lower() != final_wav_filepath.lower():
-                    os.remove(filepath)
-                
-                # Rename the temporary file to the final filename
-                os.rename(temp_wav_filepath, final_wav_filepath)
-                
-                filepath = final_wav_filepath
+                converted = convert_to_flac(filepath)
+                filepath = str(converted)
                 filename_for_asr = os.path.basename(filepath)
-                
-                # Update database with new path and mime type
                 recording.audio_path = filepath
                 recording.mime_type, _ = mimetypes.guess_type(filepath)
                 db.session.commit()
-
-            except FileNotFoundError:
-                app.logger.error("ffmpeg command not found. Please ensure ffmpeg is installed and in the system's PATH.")
-                return jsonify({'error': 'Audio conversion tool (ffmpeg) not found on server.'}), 500
-            except subprocess.CalledProcessError as e:
-                app.logger.error(f"ffmpeg conversion failed for {filepath}: {e.stderr}")
-                return jsonify({'error': f'Failed to convert audio file: {e.stderr}'}), 500
+            except AudioConversionError as e:
+                app.logger.error(str(e))
+                return jsonify({'error': str(e)}), 500
 
         # --- Proceed with reprocessing ---
         recording.transcription = None
@@ -2771,43 +2749,23 @@ def upload_file():
         file.save(filepath)
         app.logger.info(f"File saved to {filepath}")
 
-        # --- Convert non-wav/mp3/flac files to WAV ---
+        # --- Convert non-wav/mp3/flac files to FLAC ---
         filename_lower = original_filename.lower()
         supported_formats = ('.wav', '.mp3', '.flac')
         convertible_formats = ('.amr', '.3gp', '.3gpp', '.m4a', '.aac', '.ogg', '.wma', '.webm')
         
         if not filename_lower.endswith(supported_formats):
             if filename_lower.endswith(convertible_formats):
-                app.logger.info(f"Converting {filename_lower} format to WAV for processing.")
+                app.logger.info(f"Converting {filename_lower} format to FLAC for processing.")
             else:
-                app.logger.info(f"Attempting to convert unknown format ({filename_lower}) to WAV.")
-            
-            base_filepath, _ = os.path.splitext(filepath)
-            temp_wav_filepath = f"{base_filepath}_temp.wav"
-            wav_filepath = f"{base_filepath}.wav"
+                app.logger.info(f"Attempting to convert unknown format ({filename_lower}) to FLAC.")
 
             try:
-                # Using -acodec pcm_s16le for standard WAV format, 16kHz sample rate, mono
-                subprocess.run(
-                    ['ffmpeg', '-i', filepath, '-y', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav_filepath],
-                    check=True, capture_output=True, text=True
-                )
-                app.logger.info(f"Successfully converted {filepath} to {temp_wav_filepath}")
-                
-                # If the original file is not the same as the final wav file, remove it
-                if filepath.lower() != wav_filepath.lower():
-                    os.remove(filepath)
-                
-                # Rename the temporary file to the final filename
-                os.rename(temp_wav_filepath, wav_filepath)
-                
-                filepath = wav_filepath
-            except FileNotFoundError:
-                app.logger.error("ffmpeg command not found. Please ensure ffmpeg is installed and in the system's PATH.")
-                return jsonify({'error': 'Audio conversion tool (ffmpeg) not found on server.'}), 500
-            except subprocess.CalledProcessError as e:
-                app.logger.error(f"ffmpeg conversion failed for {filepath}: {e.stderr}")
-                return jsonify({'error': f'Failed to convert audio file: {e.stderr}'}), 500
+                converted = convert_to_flac(filepath)
+                filepath = str(converted)
+            except AudioConversionError as e:
+                app.logger.error(str(e))
+                return jsonify({'error': str(e)}), 500
 
         # Get final file size (of original or converted file)
         final_file_size = os.path.getsize(filepath)

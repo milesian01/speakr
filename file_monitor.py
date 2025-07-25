@@ -17,6 +17,7 @@ from pathlib import Path
 import mimetypes
 import subprocess
 from werkzeug.utils import secure_filename
+from utils.media import convert_to_flac, AudioConversionError
 
 # Flask app components will be imported inside functions to avoid circular imports
 
@@ -368,34 +369,15 @@ class FileMonitor:
         if filename_lower.endswith(supported_formats):
             return file_path
             
-        # Need to convert
-        self.logger.info(f"Converting {filename_lower} format to WAV")
-        
-        base_path = file_path.with_suffix('')
-        temp_wav_path = base_path.with_suffix('.temp.wav')
-        final_wav_path = base_path.with_suffix('.wav')
-        
+        # Need to convert to FLAC
+        self.logger.info(f"Converting {filename_lower} format to FLAC")
+
         try:
-            # Convert using ffmpeg
-            subprocess.run([
-                'ffmpeg', '-i', str(file_path), '-y', 
-                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', 
-                str(temp_wav_path)
-            ], check=True, capture_output=True, text=True)
-            
-            self.logger.info(f"Successfully converted {file_path} to {temp_wav_path}")
-            
-            # Remove original and rename temp file
-            file_path.unlink()
-            temp_wav_path.rename(final_wav_path)
-            
-            return final_wav_path
-            
-        except FileNotFoundError:
-            self.logger.error("ffmpeg not found. Please ensure ffmpeg is installed.")
-            raise
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"ffmpeg conversion failed: {e.stderr}")
+            final_flac_path = convert_to_flac(file_path)
+            self.logger.info(f"Successfully converted {file_path} to {final_flac_path}")
+            return final_flac_path
+        except AudioConversionError as e:
+            self.logger.error(str(e))
             raise
 
 
