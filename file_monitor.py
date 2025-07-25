@@ -310,16 +310,20 @@ class FileMonitor:
                     self.logger.warning(f"Locked file {processing_path} was already deleted.")
                 
                 # Convert file if necessary (same logic as upload_file)
-                final_path = self._convert_file_if_needed(destination_path, original_filename)
-                
-                # Get file size and MIME type
+                final_path, video_path, original_mime_type = self._convert_file_if_needed(
+                    destination_path, original_filename
+                )
+
+                # Get file size and MIME type of the converted audio
                 file_size = final_path.stat().st_size
                 mime_type, _ = mimetypes.guess_type(str(final_path))
                 
                 # Create database record
                 recording = Recording(
                     audio_path=str(final_path),
+                    video_path=str(video_path) if video_path else None,
                     original_filename=original_filename,
+                    original_mime_type=original_mime_type,
                     title=f"Auto-processed - {original_filename}",
                     file_size=file_size,
                     status='PENDING',
@@ -353,44 +357,59 @@ class FileMonitor:
                 
     def _convert_file_if_needed(self, file_path, original_filename):
         """
-        Convert audio file to supported format if needed.
-        
+        Convert the uploaded file to FLAC for transcription.
+
+        If the original file is a video, keep it and store its path in
+        ``video_path`` while extracting the audio track as FLAC. For audio files
+        that are not already FLAC, convert them to FLAC and delete the original
+        file.
+
         Args:
             file_path (Path): Current file path
             original_filename (str): Original filename for format detection
-            
+
         Returns:
-            Path: Path to the final (possibly converted) file
+            Tuple[Path, Optional[Path], str]:
+                - Path to the FLAC audio file used for transcription
+                - Path to the original video file if it was a video, otherwise
+                  ``None``
+                - MIME type of the original file
         """
+
         filename_lower = original_filename.lower()
-        supported_formats = ('.wav', '.mp3', '.flac')
-        
-        if filename_lower.endswith(supported_formats):
-            return file_path
-            
-        # Need to convert
-        self.logger.info(f"Converting {filename_lower} format to WAV")
-        
+        original_mime_type, _ = mimetypes.guess_type(str(file_path))
+        is_video = bool(original_mime_type and original_mime_type.startswith('video'))
+
+        video_path = None
+
+        # If already FLAC and not a video, return as is
+        if not is_video and filename_lower.endswith('.flac'):
+            return file_path, video_path, original_mime_type
+
+        self.logger.info(f"Converting {filename_lower} format to FLAC")
+
         base_path = file_path.with_suffix('')
-        temp_wav_path = base_path.with_suffix('.temp.wav')
-        final_wav_path = base_path.with_suffix('.wav')
-        
+        temp_flac_path = base_path.with_suffix('.temp.flac')
+        final_flac_path = base_path.with_suffix('.flac')
+
         try:
-            # Convert using ffmpeg
-            subprocess.run([
-                'ffmpeg', '-i', str(file_path), '-y', 
-                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', 
-                str(temp_wav_path)
-            ], check=True, capture_output=True, text=True)
-            
-            self.logger.info(f"Successfully converted {file_path} to {temp_wav_path}")
-            
-            # Remove original and rename temp file
-            file_path.unlink()
-            temp_wav_path.rename(final_wav_path)
-            
-            return final_wav_path
-            
+            ffmpeg_cmd = ['ffmpeg', '-i', str(file_path), '-y']
+            if is_video:
+                # Ignore the video stream and keep the file for later use
+                ffmpeg_cmd += ['-vn']
+                video_path = file_path
+            ffmpeg_cmd += ['-acodec', 'flac', '-ar', '16000', '-ac', '1', str(temp_flac_path)]
+
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+
+            self.logger.info(f"Successfully converted {file_path} to {temp_flac_path}")
+
+            if not is_video:
+                file_path.unlink()
+            temp_flac_path.rename(final_flac_path)
+
+            return final_flac_path, video_path, original_mime_type
+
         except FileNotFoundError:
             self.logger.error("ffmpeg not found. Please ensure ffmpeg is installed.")
             raise
